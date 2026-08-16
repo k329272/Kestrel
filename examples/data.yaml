@@ -1,0 +1,14 @@
+names:
+- Paper
+- Rock
+- Scissors
+nc: 3
+roboflow:
+  license: Private
+  project: rock-paper-scissors-sxsw-icxk5-dwxzk
+  url: https://universe.roboflow.com/hand-tracking-ecvbj/rock-paper-scissors-sxsw-icxk5-dwxzk/dataset/9
+  version: 9
+  workspace: hand-tracking-ecvbj
+test: test/images
+train: train/images
+val: valid/images

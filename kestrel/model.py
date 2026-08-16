@@ -15,9 +15,6 @@ from .nn import build_bbox_model, build_class_model, parse_scale
 from .results import Results
 
 DEFAULT_NAMES = {0: "Rock", 1: "Paper", 2: "Scissors"}
-# Continuous target each class is trained toward on the classifier head
-# (tanh-bounded, and reused as the auxiliary input to the bbox head).
-CLASS_VALUE = {0: -1.0, 1: 0.0, 2: 1.0}
 
 
 class Kestrel:
@@ -45,6 +42,7 @@ class Kestrel:
         self.metrics = None
         self._bbox_stats = None   # avg width/height/center_y of hand boxes, learned in train()
         self._val_cache = None
+        self.class_values = {}
 
         model = str(model)
         if model.endswith((".yaml", ".yml")):
@@ -75,10 +73,27 @@ class Kestrel:
                 if isinstance(names, list)
                 else {int(k): v for k, v in names.items()}
             )
+            self.cfg["names"] = self.names
+            self.cfg["nc"] = len(self.names)
+        self._refresh_class_values()
 
         self.scale = parse_scale(cfg_path)
         self.class_model = build_class_model(cfg, self.scale)
         self.bbox_model = build_bbox_model(cfg, self.scale)
+
+    def _refresh_class_values(self):
+        """Spread the available class IDs across the classifier's full tanh range."""
+        class_ids = sorted(int(k) for k in self.names)
+        if not class_ids:
+            self.class_values = {}
+            return
+        values = [0.0] if len(class_ids) == 1 else np.linspace(
+            -1.0, 1.0, num=len(class_ids), dtype=np.float32)
+
+        self.class_values = {
+            cls_id: float(val)
+            for cls_id, val in zip(class_ids, values)
+        }
 
     def _ensure_arch(self, imgsz, names):
         """(Re)build the two heads if the auto-detected dataset geometry/classes
@@ -89,6 +104,9 @@ class Kestrel:
             self.cfg["imgsz"] = list(imgsz)
             if names:
                 self.names = names
+                self.cfg["names"] = self.names
+                self.cfg["nc"] = len(self.names)
+                self._refresh_class_values()
             self.class_model = build_class_model(self.cfg, self.scale)
             self.bbox_model = build_bbox_model(self.cfg, self.scale)
 
@@ -115,6 +133,9 @@ class Kestrel:
         self.train_args = meta.get("train_args", {})
         self.cfg = meta.get("cfg", {})
         self.scale = meta.get("scale", "n")
+        self.cfg["names"] = self.names
+        self.cfg["nc"] = len(self.names)
+        self._refresh_class_values()
 
     def save(self, path="kestrel_model.pt"):
         """Bundle both Keras models + metadata into a single .pt-style zip file."""
@@ -182,17 +203,16 @@ class Kestrel:
         }
         return self.metrics
 
-    @staticmethod
-    def _idx_to_value(y_class_idx):
-        return np.array([CLASS_VALUE.get(int(v), 0.0) for v in y_class_idx], dtype=np.float32)
+    def _idx_to_value(self, y_class_idx):
+        return np.array([self.class_values.get(int(v), 0.0) for v in y_class_idx], dtype=np.float32)
 
-    @staticmethod
-    def _value_to_idx(v):
-        if v < -1 / 3:
+    def _value_to_idx(self, v):
+        if not self.class_values:
             return 0
-        elif v < 1 / 3:
-            return 1
-        return 2
+
+        class_ids = np.array(sorted(self.class_values), dtype=np.int64)
+        class_values = np.array([self.class_values[i] for i in class_ids], dtype=np.float32)
+        return int(class_ids[np.argmin(np.abs(class_values - float(v)))])
 
     # ---------------------------------------------------------------------- val
     def val(self, data=None, batch_size=64):
