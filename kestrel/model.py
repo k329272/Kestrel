@@ -104,9 +104,7 @@ class Kestrel:
             self.cfg["imgsz"] = list(imgsz)
             if names:
                 self.names = names
-                self.cfg["names"] = self.names
-                self.cfg["nc"] = len(self.names)
-                self._refresh_class_values()
+                self._extract_classes()
             self.class_model = build_class_model(self.cfg, self.scale)
             self.bbox_model = build_bbox_model(self.cfg, self.scale)
 
@@ -116,11 +114,11 @@ class Kestrel:
             raise FileNotFoundError(f"Model weights not found: {pt_path}")
         tmp = Path(f".kestrel_load_{os.getpid()}")
         try:
-            self._extract_from_load(pt_path, tmp)
+            self._load_path(pt_path, tmp)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def _extract_from_load(self, pt_path, tmp):
+    def _load_path(self, pt_path, tmp):
         with zipfile.ZipFile(pt_path, "r") as zf:
             zf.extractall(path=tmp)
         import tensorflow as tf
@@ -133,6 +131,10 @@ class Kestrel:
         self.train_args = meta.get("train_args", {})
         self.cfg = meta.get("cfg", {})
         self.scale = meta.get("scale", "n")
+        self._extract_classes()
+
+    # TODO Rename this here and in `_ensure_arch` and `_extract_from_load`
+    def _extract_classes(self):
         self.cfg["names"] = self.names
         self.cfg["nc"] = len(self.names)
         self._refresh_class_values()
