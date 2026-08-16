@@ -1,0 +1,19 @@
+# Kestrel default model architecture (used when a requested .yaml isn't found on disk).
+# imgsz/nc/names below are just fallback defaults for building/predicting before any
+# training has happened -- train() auto-detects the real values from the dataset
+# (image size + classes) the same way YOLO does, and rebuilds the heads to match.
+imgsz: [160, 120]      # [width, height]
+nc: 3
+names:
+  0: Rock
+  1: Paper
+  2: Scissors
+
+cls:                    # classifier head (runs FIRST, on the full frame)
+  filters: 8
+  dense: 16
+
+bbox:                   # bbox head (runs SECOND, conditioned on the predicted class)
+  filters: 8            # Conv2D filters (scaled by the model-size letter, e.g. the 'n' in kestrel26n)
+  dense: 24             # Dense units after concatenating image features + class embedding
+  class_embed: 8         # size of the small embedding the class value is projected into
