@@ -12,6 +12,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 import yaml
+from tqdm.auto import tqdm
 
 from .data import load_dataset
 from .nn import build_model
@@ -134,12 +135,14 @@ class Kestrel:
         bbox_loss_fn = nn.SmoothL1Loss()
 
         history = {"class_loss": [], "bbox_loss": [], "total_loss": []}
-        for _epoch in range(epochs):
+        epoch_bar = tqdm(range(epochs), desc="train", unit="epoch")
+        for _epoch in epoch_bar:
             class_loss_sum = 0.0
             bbox_loss_sum = 0.0
             total_sum = 0.0
             count = 0
-            for xb, y_class, y_bbox in train_loader:
+            batch_bar = tqdm(train_loader, desc="batch", unit="batch", leave=False)
+            for xb, y_class, y_bbox in batch_bar:
                 xb = xb.to(self.device)
                 y_class = y_class.to(self.device)
                 y_bbox = y_bbox.to(self.device)
@@ -158,9 +161,20 @@ class Kestrel:
                 total_sum += float(loss.item()) * batch
                 count += batch
 
+                batch_bar.set_postfix(
+                    class_loss=float(class_loss.item()),
+                    bbox_loss=float(bbox_loss.item()),
+                    total=float(loss.item()),
+                )
+
             history["class_loss"].append(class_loss_sum / max(1, count))
             history["bbox_loss"].append(bbox_loss_sum / max(1, count))
             history["total_loss"].append(total_sum / max(1, count))
+            epoch_bar.set_postfix(
+                class_loss=history["class_loss"][-1],
+                bbox_loss=history["bbox_loss"][-1],
+                total_loss=history["total_loss"][-1],
+            )
 
         self.metrics = {
             "class_loss": history["class_loss"][-1] if history["class_loss"] else None,
@@ -203,11 +217,36 @@ class Kestrel:
         class_loss_fn = nn.CrossEntropyLoss()
         bbox_loss_fn = nn.SmoothL1Loss()
         with torch.no_grad():
-            class_logits, bbox_pred = self.model(Xval_t)
-            class_loss = float(class_loss_fn(class_logits, yc_val_t).item())
-            bbox_loss = float(bbox_loss_fn(bbox_pred, yb_val_t).item())
-            pred_labels = class_logits.argmax(dim=1)
-            class_acc = float((pred_labels == yc_val_t).float().mean().item())
+            val_loader = DataLoader(
+                TensorDataset(Xval_t, yc_val_t, yb_val_t),
+                batch_size=batch_size,
+                shuffle=False,
+            )
+            class_loss_sum = 0.0
+            bbox_loss_sum = 0.0
+            correct = 0
+            total = 0
+            val_bar = tqdm(val_loader, desc="val", unit="batch")
+            for xb, y_class, y_bbox in val_bar:
+                class_logits, bbox_pred = self.model(xb)
+                class_loss = class_loss_fn(class_logits, y_class)
+                bbox_loss = bbox_loss_fn(bbox_pred, y_bbox)
+                pred_labels = class_logits.argmax(dim=1)
+
+                batch = xb.size(0)
+                class_loss_sum += float(class_loss.item()) * batch
+                bbox_loss_sum += float(bbox_loss.item()) * batch
+                correct += int((pred_labels == y_class).sum().item())
+                total += batch
+
+                val_bar.set_postfix(
+                    class_loss=float(class_loss.item()),
+                    bbox_loss=float(bbox_loss.item()),
+                )
+
+            class_loss = class_loss_sum / max(1, total)
+            bbox_loss = bbox_loss_sum / max(1, total)
+            class_acc = correct / max(1, total)
 
         self.metrics = {
             "class_loss": class_loss,
@@ -227,7 +266,8 @@ class Kestrel:
         out = []
         self.model.eval()
         with torch.no_grad():
-            for gray, orig in zip(images_gray, originals):
+            predict_bar = tqdm(zip(images_gray, originals), total=len(originals), desc="predict", unit="image")
+            for gray, orig in predict_bar:
                 oh, ow = gray.shape[:2]
                 resized = cv2.resize(gray, imgsz).astype(np.float32) / 255.0
                 img_in = torch.from_numpy(resized)[None, None, ...].to(self.device)
@@ -252,6 +292,7 @@ class Kestrel:
                         conf=np.array([conf], dtype=np.float32),
                     )
                 )
+                predict_bar.set_postfix(class_id=class_idx, conf=f"{conf:.2f}")
         return out
 
     @staticmethod
