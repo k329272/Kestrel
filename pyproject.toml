@@ -4,19 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kestrel"
-version = "0.1.0"
-description = "A YOLO-style API around a two-head TensorFlow rock-paper-scissors detector"
-requires-python = ">=3.9"
+version = "0.2.0"
+description = "A small PyTorch rock-paper-scissors detector with a YOLO-style API"
+requires-python = ">=3.10"
 dependencies = [
-    "tensorflow>=2.12",
+    "torch>=2.2",
     "opencv-python-headless",
     "numpy",
-    "pandas",
     "pyyaml",
 ]
-
-[project.optional-dependencies]
-onnx = ["tf2onnx"]
 
 [tool.setuptools]
 packages = ["kestrel"]

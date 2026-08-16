@@ -1,82 +1,67 @@
-"""Architecture builders for the two Kestrel heads.
+"""PyTorch network used by Kestrel."""
 
-Pipeline order (class-first cascade):
+from __future__ import annotations
 
-  1. class_model(image) -> predicted class value in [-1, 1]  (Rock/Paper/Scissors)
-  2. bbox_model(image, class_value) -> predicted xmin of the hand
+from collections.abc import Sequence
 
-The bbox head now takes the class prediction as a second input (a small
-embedding concatenated onto the image features), so it can condition its box
-estimate on what it's looking for . This is why the class model needs to run
-first and why its input covers the full frame rather than a small crop
-around a not-yet-known box.
+import torch
+from torch import nn
 
-Model names follow a YOLO-style convention: `kestrel26n.yaml` -> the
-trailing letter (n/s/m/l/x) scales the width of the network, same idea as
-ultralytics' n/s/m/l/x checkpoints.
-"""
-
-import tensorflow as tf
-
-# width_multiple only -- these are tiny models, depth scaling isn't used.
-SCALES = {
-    "n": 0.25,  # nano
-    "s": 0.50,  # small
-    "m": 0.75,  # medium
-    "l": 1.00,  # large
-    "x": 1.25,  # xlarge
+DEFAULT_MODEL_CFG = {
+    "channels": [16, 32, 64],
+    "hidden": 64,
 }
-DEFAULT_SCALE = "n"
 
 
-def parse_scale(cfg_path):
-    """Extract the trailing scale letter from a filename like 'kestrel26n.yaml'.
-
-    Falls back to DEFAULT_SCALE if there's no recognized letter suffix.
-    """
-    stem = str(cfg_path).rsplit("/", 1)[-1].rsplit(".", 1)[0]
-    if stem and stem[-1].lower() in SCALES:
-        return stem[-1].lower()
-    return DEFAULT_SCALE
+def _as_channels(value: Sequence[int] | int | None) -> list[int]:
+    if value is None:
+        return list(DEFAULT_MODEL_CFG["channels"])
+    if isinstance(value, int):
+        return [value]
+    return [int(v) for v in value]
 
 
-def _scaled(base_channels, scale):
-    mult = SCALES.get(scale, SCALES[DEFAULT_SCALE])
-    return max(1, round(base_channels * mult / SCALES[DEFAULT_SCALE]))
+class KestrelNet(nn.Module):
+    """A small shared-backbone classifier + box regressor."""
+
+    def __init__(self, nc: int = 3, channels: Sequence[int] | int | None = None, hidden: int = 64):
+        super().__init__()
+        channels = _as_channels(channels)
+        if not channels:
+            channels = list(DEFAULT_MODEL_CFG["channels"])
+
+        layers: list[nn.Module] = []
+        in_channels = 1
+        for out_channels in channels:
+            layers.extend(
+                [
+                    nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.MaxPool2d(kernel_size=2),
+                ]
+            )
+            in_channels = out_channels
+
+        self.backbone = nn.Sequential(
+            *layers,
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(in_channels, hidden),
+            nn.ReLU(inplace=True),
+        )
+        self.class_head = nn.Linear(hidden, nc)
+        self.box_head = nn.Linear(hidden, 4)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        features = self.backbone(x)
+        class_logits = self.class_head(features)
+        box = torch.sigmoid(self.box_head(features))
+        return class_logits, box
 
 
-def build_class_model(cfg, scale=DEFAULT_SCALE):
-    """Runs FIRST, on the full frame (not a crop -- there's no box to crop to yet)."""
-    width, height = cfg.get("imgsz", [160, 120])
-    filters = _scaled(cfg.get("cls", {}).get("filters", 8), scale)
-    dense_units = _scaled(cfg.get("cls", {}).get("dense", 16), scale)
-
-    inp = tf.keras.Input(shape=(height, width, 1), name="class_image_input")
-    x = tf.keras.layers.Conv2D(filters, (3, 3), padding="same", activation="relu")(inp)
-    x = tf.keras.layers.MaxPooling2D(pool_size=(4, 4))(x)
-    x = tf.keras.layers.Flatten()(x)
-    x = tf.keras.layers.Dense(dense_units, activation="relu")(x)
-    out = tf.keras.layers.Dense(1, activation="tanh", name="class_output")(x)
-    return tf.keras.Model(inputs=inp, outputs=out, name="kestrel_class")
-
-
-def build_bbox_model(cfg, scale=DEFAULT_SCALE):
-    """Runs SECOND. Takes the image plus the class prediction from class_model."""
-    width, height = cfg.get("imgsz", [160, 120])
-    filters = _scaled(cfg.get("bbox", {}).get("filters", 8), scale)
-    dense_units = _scaled(cfg.get("bbox", {}).get("dense", 24), scale)
-    class_embed = _scaled(cfg.get("bbox", {}).get("class_embed", 8), scale)
-
-    img_in = tf.keras.Input(shape=(height, width, 1), name="bbox_image_input")
-    cls_in = tf.keras.Input(shape=(1,), name="bbox_class_input")  # predicted class value, [-1, 1]
-
-    x = tf.keras.layers.Conv2D(filters, (3, 3), padding="same", activation="relu")(img_in)
-    x = tf.keras.layers.MaxPooling2D(pool_size=(5, 5))(x)
-    x = tf.keras.layers.Flatten()(x)
-
-    c = tf.keras.layers.Dense(class_embed, activation="relu", name="class_embed")(cls_in)
-
-    x = tf.keras.layers.Concatenate(name="image_class_concat")([x, c])
-    x = tf.keras.layers.Dense(dense_units, activation="relu")(x)
-    out = tf.keras.layers.Dense(1, name="bbox_output")(x)
-    return tf.keras.Model(inputs=[img_in, cls_in], outputs=out, name="kestrel_bbox")
+def build_model(cfg: dict) -> KestrelNet:
+    model_cfg = cfg.get("model", {})
+    nc = int(cfg.get("nc", len(cfg.get("names", {})) or 3))
+    channels = model_cfg.get("channels", DEFAULT_MODEL_CFG["channels"])
+    hidden = int(model_cfg.get("hidden", DEFAULT_MODEL_CFG["hidden"]))
+    return KestrelNet(nc=nc, channels=channels, hidden=hidden)

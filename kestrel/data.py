@@ -1,27 +1,8 @@
-"""Dataset loading for Kestrel
+"""Dataset loading for Kestrel."""
 
-Accepts a standard ultralytics-style data yaml:
-
-    path: ../datasets/rps       # optional root, relative to the yaml's folder
-    train: images/train          # directory, or a .txt file listing image paths
-    val: images/val               # optional
-    nc: 3                          # optional
-    names: [Rock, Paper, Scissors] # optional
-
-Labels follow the standard YOLO convention: for an image at
-`.../images/<split>/foo.jpg`, its label file is expected at
-`.../labels/<split>/foo.txt`, one line per object:
-
-    class_id x_center y_center width height      # all normalized 0-1
-
-Like ultralytics, Kestrel does NOT require `nc`/`names`/image size to be
-declared up front -- it scans the dataset to figure them out, the same way
-`ultralytics.data.utils.check_det_dataset` infers class counts and
-`autobatch`/loader logic infers image geometry.
-"""
+from __future__ import annotations
 
 import glob
-import os
 from collections import Counter
 from pathlib import Path
 
@@ -32,13 +13,12 @@ import yaml
 IMG_EXTS = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.JPG", "*.JPEG", "*.PNG")
 
 
-def _read_yaml(data):
-    with open(data) as f:
+def _read_yaml(data: str | Path) -> dict:
+    with open(data, encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 
 def _normalize_names(names):
-    """YOLO yaml allows `names` as a list OR a {id: name} dict -- support both."""
     if names is None:
         return None
     if isinstance(names, list):
@@ -46,19 +26,14 @@ def _normalize_names(names):
     return {int(k): v for k, v in names.items()}
 
 
-def _resolve_split_images(base, split_spec):
-    """Resolve a YOLO-style split entry into a sorted list of image paths.
-
-    `split_spec` may be a directory, a .txt file listing image paths (one per
-    line, relative to `base` or absolute), or a list of paths -- all valid
-    forms in ultralytics data yamls.
-    """
-    if split_spec is None: return []
+def _resolve_split_images(base: Path, split_spec):
+    if split_spec is None:
+        return []
     if isinstance(split_spec, list):
-        out = []
-        for p in split_spec: 
-            out.extend(_resolve_split_images(base, p))
-        return sorted(set(out))
+        paths = []
+        for item in split_spec:
+            paths.extend(_resolve_split_images(base, item))
+        return sorted(set(paths))
 
     p = Path(split_spec)
     p = p if p.is_absolute() else (base / p)
@@ -70,34 +45,32 @@ def _resolve_split_images(base, split_spec):
         return sorted(set(files))
 
     if p.is_file() and p.suffix.lower() == ".txt":
-        with open(p) as f:
-            lines = [ln.strip() for ln in f if ln.strip()]
-        out = []
-        for ln in lines:
-            lp = Path(ln)
-            out.append(str(lp) if lp.is_absolute() else str((base / ln).resolve()))
-        return sorted(set(out))
+        with open(p, encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip()]
+        paths = []
+        for line in lines:
+            lp = Path(line)
+            paths.append(str(lp) if lp.is_absolute() else str((base / line).resolve()))
+        return sorted(set(paths))
 
     raise FileNotFoundError(f"Could not resolve dataset split '{split_spec}' under {base}")
 
 
-def _label_path_for(image_path):
-    """Standard YOLO convention: .../images/<split>/x.jpg -> .../labels/<split>/x.txt"""
+def _label_path_for(image_path: str | Path) -> Path:
     p = Path(image_path)
     parts = list(p.parts)
     if "images" in parts:
-        i = len(parts) - 1 - parts[::-1].index("images")
-        parts[i] = "labels"
+        idx = len(parts) - 1 - parts[::-1].index("images")
+        parts[idx] = "labels"
         return Path(*parts).with_suffix(".txt")
-    return p.with_suffix(".txt")  # fallback: label sits next to the image
+    return p.with_suffix(".txt")
 
 
-def _read_yolo_labels(label_path):
-    """Returns [(class_id, x_center, y_center, width, height), ...], all normalized 0-1."""
-    if not os.path.exists(label_path):
+def _read_yolo_labels(label_path: str | Path):
+    if not Path(label_path).exists():
         return []
     boxes = []
-    with open(label_path) as f:
+    with open(label_path, encoding="utf-8") as f:
         for line in f:
             parts = line.split()
             if len(parts) < 5:
@@ -109,8 +82,6 @@ def _read_yolo_labels(label_path):
 
 
 def discover_classes(image_paths):
-    """Scan every label file to infer nc/names, the way YOLO datasets self-describe
-    their class list when a yaml doesn't provide `names` explicitly."""
     max_id = -1
     for img in image_paths:
         for cls_id, *_ in _read_yolo_labels(_label_path_for(img)):
@@ -119,11 +90,9 @@ def discover_classes(image_paths):
 
 
 def probe_image_size(image_paths, sample=32):
-    """Auto-detect a representative (width, height) for the dataset, YOLO-style,
-    by sampling real images instead of trusting a hardcoded constant."""
     sizes = Counter()
     for image_path in image_paths[:sample]:
-        img = cv2.imread(image_path)
+        img = cv2.imread(str(image_path))
         if img is None:
             continue
         h, w = img.shape[:2]
@@ -136,48 +105,31 @@ def _preprocess_split(image_paths, imgsz):
     images, bbox_labels, class_labels = [], [], []
 
     for image_path in image_paths:
-        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
         if img is None:
             continue
         boxes = _read_yolo_labels(_label_path_for(image_path))
         if not boxes:
             continue
 
-        # Single-object assumption (as in the source pipeline): keep the largest box.
         cls_id, xc, yc, w, h = max(boxes, key=lambda b: b[3] * b[4])
+        resized = cv2.resize(img, (target_width, target_height)).astype(np.float32) / 255.0
 
-        img_resized = cv2.resize(img, (target_width, target_height))
-        img_resized = (img_resized - 128).astype(np.float32)
-
-        # Normalized YOLO box -> pixel coords in the resized frame.
-        sxmin = int(np.clip((xc - w / 2) * target_width, 0, target_width - 1))
-        sxmax = int(np.clip((xc + w / 2) * target_width, 0, target_width - 1))
-        scy = int(np.clip(yc * target_height, 0, target_height - 1))
-        symax = int(np.clip((yc + h / 2) * target_height, 0, target_height - 1))
-
-        images.append(img_resized)
-        bbox_labels.append([sxmin, scy, sxmax, symax])  # [xmin, center_y, xmax, ymax]
+        images.append(resized)
+        bbox_labels.append([xc, yc, w, h])
         class_labels.append(cls_id)
 
-    X = (np.expand_dims(np.array(images), axis=-1) if images
-         else np.empty((0, target_height, target_width, 1), dtype=np.float32))
+    X = (
+        np.expand_dims(np.array(images, dtype=np.float32), axis=-1)
+        if images
+        else np.empty((0, target_height, target_width, 1), dtype=np.float32)
+    )
     y_bbox = np.array(bbox_labels, dtype=np.float32) if bbox_labels else np.empty((0, 4), dtype=np.float32)
     y_class = np.array(class_labels, dtype=np.int64) if class_labels else np.empty((0,), dtype=np.int64)
     return X, y_bbox, y_class
 
 
 def load_dataset(data, imgsz=None, val_split=0.2, seed=0):
-    """Parse a YOLO-format dataset described by `data` (a yaml path).
-
-    Auto-detects whatever the yaml doesn't explicitly declare: image size
-    (`imgsz=None`) and class list (`names` missing from the yaml) -- mirroring
-    how ultralytics datasets self-describe rather than requiring everything
-    spelled out up front.
-
-    Returns: (X_train, y_bbox_train, y_class_train,
-              X_val, y_bbox_val, y_class_val,
-              names, imgsz)
-    """
     cfg = _read_yaml(data)
     base = Path(cfg.get("path", "."))
     if not base.is_absolute():
