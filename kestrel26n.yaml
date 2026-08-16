@@ -5,18 +5,11 @@
 # before training -- calling model.train(data=...) auto-detects the real
 # image size and class list from the dataset (like YOLO) and rebuilds the
 # heads to match if they differ from what's below.
-imgsz: [160, 120]
-nc: 3
-names:
-  0: Rock
-  1: Paper
-  2: Scissors
-
 cls:                  # classifier head -- runs FIRST, on the full frame
-  filters: 8
+  filters: 16
   dense: 16
 
 bbox:                 # bbox head -- runs SECOND, conditioned on the predicted class
-  filters: 8
-  dense: 24
-  class_embed: 8
+  filters: 16
+  dense: 32
+  class_embed: 4
