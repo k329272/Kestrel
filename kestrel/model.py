@@ -87,12 +87,13 @@ class Kestrel:
         if pin_memory is None:
             pin_memory = device.type == "cuda"
         if num_workers is None:
-            cpu_count = os.cpu_count() or 0
-            num_workers = min(4, cpu_count) if cpu_count > 1 else 0
+            # Default to single-process loading to avoid multiprocessing shutdown
+            num_workers = 0
         return {
             "batch_size": batch_size,
             "pin_memory": pin_memory,
             "num_workers": num_workers,
+            "persistent_workers": bool(num_workers),
         }
 
     @staticmethod
