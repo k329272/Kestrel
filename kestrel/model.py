@@ -259,7 +259,7 @@ class Kestrel:
     def __call__(self, source, **kwargs):
         return self.predict(source, **kwargs)
 
-    def predict(self, source, imgsz=None):
+    def predict(self, source, imgsz=None, conf=0.25):
         imgsz = tuple(imgsz or self.cfg.get("imgsz", (160, 120)))
         images_gray, originals = self._load_sources(source)
 
@@ -273,9 +273,10 @@ class Kestrel:
                 img_in = torch.from_numpy(resized)[None, None, ...].to(self.device)
 
                 class_logits, bbox_pred = self.model(img_in)
-                probs = torch.softmax(class_logits, dim=1)[0]
-                class_idx = int(probs.argmax().item())
-                conf = float(probs[class_idx].item())
+                probs = torch.softmax(class_logits, dim=1)[0].detach().cpu().numpy()
+                class_ids = np.flatnonzero(probs >= conf)
+                if class_ids.size == 0:
+                    class_ids = np.array([int(np.argmax(probs))], dtype=np.int64)
 
                 cx, cy, w, h = bbox_pred[0].clamp(0.0, 1.0).cpu().numpy()
                 x1 = int(np.clip((cx - w / 2) * ow, 0, ow - 1))
@@ -283,16 +284,20 @@ class Kestrel:
                 x2 = int(np.clip((cx + w / 2) * ow, 0, ow - 1))
                 y2 = int(np.clip((cy + h / 2) * oh, 0, oh - 1))
 
+                boxes = np.repeat(np.array([[x1, y1, x2, y2]], dtype=np.float32), len(class_ids), axis=0)
+                confs = probs[class_ids].astype(np.float32)
+
                 out.append(
                     Results(
                         orig_img=orig,
-                        boxes=np.array([[x1, y1, x2, y2]], dtype=np.float32),
-                        cls=np.array([class_idx], dtype=np.int64),
+                        boxes=boxes,
+                        cls=class_ids.astype(np.int64),
                         names=self.names,
-                        conf=np.array([conf], dtype=np.float32),
+                        conf=confs,
+                        probs=probs.astype(np.float32),
                     )
                 )
-                predict_bar.set_postfix(class_id=class_idx, conf=f"{conf:.2f}")
+                predict_bar.set_postfix(class_ids=",".join(map(str, class_ids.tolist())), conf=f"{float(confs.max()):.2f}")
         return out
 
     @staticmethod

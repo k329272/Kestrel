@@ -23,11 +23,13 @@ class Results:
     cls: np.ndarray
     names: dict
     conf: np.ndarray | None = None
+    probs: np.ndarray | None = None
 
     def __post_init__(self):
         self.boxes = np.asarray(self.boxes, dtype=np.float32).reshape(-1, 4)
         self.cls = np.asarray(self.cls).reshape(-1)
         self.conf = None if self.conf is None else np.asarray(self.conf).reshape(-1)
+        self.probs = None if self.probs is None else np.asarray(self.probs, dtype=np.float32)
 
     def __len__(self):
         return len(self.boxes)
@@ -39,6 +41,7 @@ class Results:
             cls=self.cls[idx],
             names=self.names,
             conf=None if self.conf is None else self.conf[idx],
+            probs=self.probs,
         )
 
     def _label_for(self, i: int) -> str:
@@ -93,5 +96,6 @@ class Results:
             "boxes": self.boxes.tolist(),
             "cls": self.cls.tolist(),
             "conf": None if self.conf is None else self.conf.tolist(),
+            "probs": None if self.probs is None else self.probs.tolist(),
             "names": dict(self.names),
         }
