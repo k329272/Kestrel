@@ -139,7 +139,7 @@ def _preprocess_split(image_paths, imgsz, adaptive_equalization=False, clahe_cli
                 boxes_by_class[cls_id] = (xc, yc, w, h, area)
 
         cls_ids = sorted(boxes_by_class.keys())
-        _, xc, yc, w, h, _ = max(boxes_by_class.values(), key=lambda b: b[-1])
+        xc, yc, w, h, _ = max(boxes_by_class.values(), key=lambda b: b[-1])
         resized = cv2.resize(img, (target_width, target_height)).astype(np.float32) / 255.0
 
         images.append(resized)
