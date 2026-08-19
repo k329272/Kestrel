@@ -6,5 +6,7 @@ names:
   2: Scissors
 
 model:
-  channels: [16, 32, 64]
-  hidden: 64
+  channels: [24, 48, 96]
+  hidden: 128
+  dropout: 0.1
+  se_ratio: 0.25
