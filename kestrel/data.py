@@ -13,6 +13,18 @@ import yaml
 IMG_EXTS = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.JPG", "*.JPEG", "*.PNG")
 
 
+def apply_adaptive_equalization(image, enabled=False, clip_limit=2.0, tile_grid_size=(8, 8)):
+    """Optionally enhance grayscale contrast with CLAHE."""
+    if not enabled:
+        return image
+    if image is None:
+        return None
+    if image.ndim == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=float(clip_limit), tileGridSize=tuple(tile_grid_size))
+    return clahe.apply(image)
+
+
 def _read_yaml(data: str | Path) -> dict:
     with open(data, encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
@@ -100,7 +112,7 @@ def probe_image_size(image_paths, sample=32):
     return sizes.most_common(1)[0][0] if sizes else None
 
 
-def _preprocess_split(image_paths, imgsz):
+def _preprocess_split(image_paths, imgsz, adaptive_equalization=False, clahe_clip_limit=2.0, clahe_tile_grid_size=(8, 8)):
     target_width, target_height = imgsz
     images, bbox_labels, class_labels = [], [], []
 
@@ -108,6 +120,12 @@ def _preprocess_split(image_paths, imgsz):
         img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
         if img is None:
             continue
+        img = apply_adaptive_equalization(
+            img,
+            enabled=adaptive_equalization,
+            clip_limit=clahe_clip_limit,
+            tile_grid_size=clahe_tile_grid_size,
+        )
         boxes = _read_yolo_labels(_label_path_for(image_path))
         if not boxes:
             continue
@@ -129,7 +147,15 @@ def _preprocess_split(image_paths, imgsz):
     return X, y_bbox, y_class
 
 
-def load_dataset(data, imgsz=None, val_split=0.2, seed=0):
+def load_dataset(
+    data,
+    imgsz=None,
+    val_split=0.2,
+    seed=0,
+    adaptive_equalization=False,
+    clahe_clip_limit=2.0,
+    clahe_tile_grid_size=(8, 8),
+):
     cfg = _read_yaml(data)
     base = Path(cfg.get("path", "."))
     if not base.is_absolute():
@@ -151,10 +177,22 @@ def load_dataset(data, imgsz=None, val_split=0.2, seed=0):
         imgsz = probed or (160, 120)
     imgsz = tuple(imgsz)
 
-    Xtr, yb_tr, yc_tr = _preprocess_split(train_images, imgsz)
+    Xtr, yb_tr, yc_tr = _preprocess_split(
+        train_images,
+        imgsz,
+        adaptive_equalization=adaptive_equalization,
+        clahe_clip_limit=clahe_clip_limit,
+        clahe_tile_grid_size=clahe_tile_grid_size,
+    )
 
     if val_images:
-        Xval, yb_val, yc_val = _preprocess_split(val_images, imgsz)
+        Xval, yb_val, yc_val = _preprocess_split(
+            val_images,
+            imgsz,
+            adaptive_equalization=adaptive_equalization,
+            clahe_clip_limit=clahe_clip_limit,
+            clahe_tile_grid_size=clahe_tile_grid_size,
+        )
     else:
         n = len(Xtr)
         n_val = int(n * val_split)

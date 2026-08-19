@@ -77,6 +77,11 @@ class Kestrel:
         self.train_args = {}
         self.metrics = None
         self._val_cache = None
+        self.preprocess = {
+            "adaptive_equalization": False,
+            "clahe_clip_limit": 2.0,
+            "clahe_tile_grid_size": (8, 8),
+        }
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         model = str(model)
@@ -210,6 +215,16 @@ class Kestrel:
         class_acc = None if total <= 0 else correct / total
         return self._metric_bundle(class_loss, bbox_loss, class_acc)
 
+    def _preprocess_image(self, gray):
+        from .data import apply_adaptive_equalization
+
+        return apply_adaptive_equalization(
+            gray,
+            enabled=self.preprocess.get("adaptive_equalization", False),
+            clip_limit=self.preprocess.get("clahe_clip_limit", 2.0),
+            tile_grid_size=self.preprocess.get("clahe_tile_grid_size", (8, 8)),
+        )
+
     # -------------------------------------------------------------- load/save
     def _load(self, pt_path):
         if not os.path.exists(pt_path):
@@ -217,6 +232,7 @@ class Kestrel:
         ckpt = torch.load(pt_path, map_location="cpu")
         self.cfg = ckpt.get("cfg", {})
         self.names = {int(k): v for k, v in ckpt.get("names", DEFAULT_NAMES).items()}
+        self.preprocess.update(ckpt.get("preprocess", {}))
         self.model = build_model(self.cfg).to(self.device)
         self.model.load_state_dict(ckpt["model_state"])
         self.train_args = ckpt.get("train_args", {})
@@ -230,6 +246,11 @@ class Kestrel:
             "names": self.names,
             "train_args": self.train_args,
             "metrics": self.metrics,
+            "preprocess": {
+                "adaptive_equalization": self.preprocess["adaptive_equalization"],
+                "clahe_clip_limit": self.preprocess["clahe_clip_limit"],
+                "clahe_tile_grid_size": list(self.preprocess["clahe_tile_grid_size"]),
+            },
         }
         torch.save(payload, path)
         return path
@@ -248,12 +269,22 @@ class Kestrel:
         min_delta=0.0,
         scheduler_factor=0.5,
         scheduler_patience=3,
+        adaptive_equalization=None,
+        clahe_clip_limit=None,
+        clahe_tile_grid_size=None,
         num_workers=None,
         pin_memory=None,
         amp=None,
         save_best=False,
         best_path="kestrel_best.pt",
     ):
+        if adaptive_equalization is not None:
+            self.preprocess["adaptive_equalization"] = bool(adaptive_equalization)
+        if clahe_clip_limit is not None:
+            self.preprocess["clahe_clip_limit"] = float(clahe_clip_limit)
+        if clahe_tile_grid_size is not None:
+            self.preprocess["clahe_tile_grid_size"] = tuple(clahe_tile_grid_size)
+
         (
             Xtr,
             yb_tr,
@@ -263,7 +294,14 @@ class Kestrel:
             yc_val,
             names,
             detected_imgsz,
-        ) = load_dataset(data, imgsz=imgsz, val_split=val_split)
+        ) = load_dataset(
+            data,
+            imgsz=imgsz,
+            val_split=val_split,
+            adaptive_equalization=self.preprocess["adaptive_equalization"],
+            clahe_clip_limit=self.preprocess["clahe_clip_limit"],
+            clahe_tile_grid_size=self.preprocess["clahe_tile_grid_size"],
+        )
 
         self._ensure_arch(detected_imgsz, names)
 
@@ -371,6 +409,9 @@ class Kestrel:
             "min_delta": min_delta,
             "scheduler_factor": scheduler_factor,
             "scheduler_patience": scheduler_patience,
+            "adaptive_equalization": self.preprocess["adaptive_equalization"],
+            "clahe_clip_limit": self.preprocess["clahe_clip_limit"],
+            "clahe_tile_grid_size": list(self.preprocess["clahe_tile_grid_size"]),
             "num_workers": num_workers,
             "pin_memory": pin_memory,
             "amp": amp,
@@ -384,7 +425,12 @@ class Kestrel:
     def val(self, data=None, batch_size=32):
         if data is not None:
             _, _, _, Xval, yb_val, yc_val, names, _ = load_dataset(
-                data, imgsz=tuple(self.cfg.get("imgsz", (160, 120))), val_split=1.0
+                data,
+                imgsz=tuple(self.cfg.get("imgsz", (160, 120))),
+                val_split=1.0,
+                adaptive_equalization=self.preprocess.get("adaptive_equalization", False),
+                clahe_clip_limit=self.preprocess.get("clahe_clip_limit", 2.0),
+                clahe_tile_grid_size=self.preprocess.get("clahe_tile_grid_size", (8, 8)),
             )
             if names:
                 self.names = names
@@ -457,6 +503,7 @@ class Kestrel:
             if img is None:
                 raise ValueError(f"Could not load image from source: {s!r}")
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+            gray = self._preprocess_image(gray)
             images.append(gray)
             originals.append(img)
         return images, originals

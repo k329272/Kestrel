@@ -9,6 +9,7 @@ one bounding-box regressor, and one simple checkpoint format.
 - Train on a standard YOLO dataset YAML.
 - Load from either a config `.yaml` file or a saved `.pt` checkpoint.
 - Run prediction on local images, image arrays, or image URLs.
+- Optionally apply adaptive histogram equalization to improve low-contrast images.
 - Save checkpoints or export TorchScript for deployment.
 - Use a familiar callable interface:
 
@@ -74,6 +75,8 @@ If `imgsz` is omitted, Kestrel samples the dataset and picks a representative si
 - `val_split` controls the fraction of training data held out for validation.
 - `patience` and `min_delta` enable early stopping on validation loss.
 - `scheduler_factor` and `scheduler_patience` control the learning-rate scheduler.
+- `adaptive_equalization=True` enables CLAHE preprocessing for train, validation, and inference.
+- `clahe_clip_limit` and `clahe_tile_grid_size` tune the contrast enhancement strength.
 - `num_workers` and `pin_memory` tune data loading performance.
 - `amp=True` enables mixed precision on CUDA.
 - `save_best=True` writes the best checkpoint to `kestrel_best.pt` by default.
@@ -86,6 +89,7 @@ model.train(
     epochs=25,
     batch_size="auto",
     lr=1e-3,
+    adaptive_equalization=True,
     bbox_loss_weight=1.0,
     patience=5,
     save_best=True,

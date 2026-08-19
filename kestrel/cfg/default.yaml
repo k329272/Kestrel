@@ -5,6 +5,11 @@ names:
   1: Paper
   2: Scissors
 
+preprocess:
+  adaptive_equalization: false
+  clahe_clip_limit: 2.0
+  clahe_tile_grid_size: [8, 8]
+
 model:
   channels: [24, 48, 96]
   hidden: 128
