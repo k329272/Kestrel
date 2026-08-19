@@ -179,7 +179,7 @@ class Kestrel:
 
         Xval_t = torch.from_numpy(Xval).permute(0, 3, 1, 2).contiguous().float()
         yb_val_t = torch.from_numpy(yb_val).float()
-        yc_val_t = torch.from_numpy(yc_val).long()
+        yc_val_t = torch.from_numpy(yc_val).float()
         val_loader = DataLoader(
             TensorDataset(Xval_t, yc_val_t, yb_val_t),
             shuffle=False,
@@ -187,7 +187,7 @@ class Kestrel:
         )
 
         self.model.eval()
-        class_loss_fn = nn.CrossEntropyLoss()
+        class_loss_fn = nn.BCEWithLogitsLoss()
         bbox_loss_fn = nn.SmoothL1Loss()
         class_loss_sum = 0.0
         bbox_loss_sum = 0.0
@@ -202,12 +202,13 @@ class Kestrel:
                 with torch.autocast(device_type="cuda", enabled=use_amp):
                     class_logits, bbox_pred = self.model(xb)
                     class_loss = class_loss_fn(class_logits, y_class)
-                    bbox_loss = bbox_loss_fn(bbox_pred, y_bbox)
-                pred_labels = class_logits.argmax(dim=1)
+                    bbox_loss = self._class_specific_bbox_loss(bbox_pred, y_bbox, y_class, bbox_loss_fn)
+                pred_labels = (torch.sigmoid(class_logits) >= 0.5).to(y_class.dtype)
+                pred_labels = pred_labels if pred_labels.ndim == y_class.ndim else pred_labels.unsqueeze(0)
                 batch = xb.size(0)
                 class_loss_sum += float(class_loss.item()) * batch
                 bbox_loss_sum += float(bbox_loss.item()) * batch
-                correct += int((pred_labels == y_class).sum().item())
+                correct += int(((pred_labels == y_class).all(dim=1)).sum().item())
                 total += batch
 
         class_loss = self._mean_loss(class_loss_sum, total)
@@ -224,6 +225,21 @@ class Kestrel:
             clip_limit=self.preprocess.get("clahe_clip_limit", 2.0),
             tile_grid_size=self.preprocess.get("clahe_tile_grid_size", (8, 8)),
         )
+
+    @staticmethod
+    def _class_specific_bbox_loss(bbox_pred, y_bbox, y_class, loss_fn):
+        """Compute bbox loss only for positive classes, sharing the same target box."""
+        if bbox_pred.ndim != 3:
+            raise ValueError(f"Expected bbox predictions with shape [B, nc, 4], got {tuple(bbox_pred.shape)}")
+        target = y_bbox[:, None, :].expand_as(bbox_pred)
+        mask = y_class > 0.5
+        if mask.ndim != 2:
+            mask = mask.reshape(mask.shape[0], -1)
+        if not torch.any(mask):
+            return bbox_pred.sum() * 0.0
+        pred = bbox_pred[mask]
+        tgt = target[mask]
+        return loss_fn(pred, tgt)
 
     # -------------------------------------------------------------- load/save
     def _load(self, pt_path):
@@ -309,7 +325,7 @@ class Kestrel:
 
         Xtr_t = torch.from_numpy(Xtr).permute(0, 3, 1, 2).contiguous().float()
         yb_tr_t = torch.from_numpy(yb_tr).float()
-        yc_tr_t = torch.from_numpy(yc_tr).long()
+        yc_tr_t = torch.from_numpy(yc_tr).float()
         train_loader = DataLoader(
             TensorDataset(Xtr_t, yc_tr_t, yb_tr_t),
             shuffle=True,
@@ -324,7 +340,7 @@ class Kestrel:
             factor=scheduler_factor,
             patience=scheduler_patience,
         )
-        class_loss_fn = nn.CrossEntropyLoss()
+        class_loss_fn = nn.BCEWithLogitsLoss()
         bbox_loss_fn = nn.SmoothL1Loss()
         scaler = torch.amp.GradScaler("cuda", enabled=(self.device.type == "cuda" if amp is None else bool(amp) and self.device.type == "cuda"))
         use_amp = self.device.type == "cuda" if amp is None else bool(amp) and self.device.type == "cuda"
@@ -349,7 +365,7 @@ class Kestrel:
                 with torch.autocast(device_type="cuda", enabled=use_amp):
                     class_logits, bbox_pred = self.model(xb)
                     class_loss = class_loss_fn(class_logits, y_class)
-                    bbox_loss = bbox_loss_fn(bbox_pred, y_bbox)
+                    bbox_loss = self._class_specific_bbox_loss(bbox_pred, y_bbox, y_class, bbox_loss_fn)
                     loss = class_loss + bbox_loss_weight * bbox_loss
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -465,13 +481,15 @@ class Kestrel:
                 if class_ids.size == 0:
                     class_ids = np.array([int(np.argmax(probs))], dtype=np.int64)
 
-                cx, cy, w, h = bbox_pred[0].clamp(0.0, 1.0).cpu().numpy()
-                x1 = int(np.clip((cx - w / 2) * ow, 0, ow - 1))
-                y1 = int(np.clip((cy - h / 2) * oh, 0, oh - 1))
-                x2 = int(np.clip((cx + w / 2) * ow, 0, ow - 1))
-                y2 = int(np.clip((cy + h / 2) * oh, 0, oh - 1))
-
-                boxes = np.repeat(np.array([[x1, y1, x2, y2]], dtype=np.float32), len(class_ids), axis=0)
+                class_boxes = bbox_pred[0, class_ids].clamp(0.0, 1.0).cpu().numpy()
+                boxes = []
+                for cx, cy, w, h in class_boxes:
+                    x1 = int(np.clip((cx - w / 2) * ow, 0, ow - 1))
+                    y1 = int(np.clip((cy - h / 2) * oh, 0, oh - 1))
+                    x2 = int(np.clip((cx + w / 2) * ow, 0, ow - 1))
+                    y2 = int(np.clip((cy + h / 2) * oh, 0, oh - 1))
+                    boxes.append([x1, y1, x2, y2])
+                boxes = np.asarray(boxes, dtype=np.float32)
                 confs = probs[class_ids].astype(np.float32)
 
                 out.append(

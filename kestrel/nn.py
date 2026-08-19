@@ -61,7 +61,7 @@ class ResidualBlock(nn.Module):
 
 
 class KestrelNet(nn.Module):
-    """A small shared-backbone classifier + box regressor."""
+    """A small shared-backbone classifier + class-specific box regressor."""
 
     def __init__(
         self,
@@ -94,12 +94,12 @@ class KestrelNet(nn.Module):
             nn.Dropout(p=dropout),
         )
         self.class_head = nn.Linear(hidden, nc)
-        self.box_head = nn.Linear(hidden, 4)
+        self.box_head = nn.Linear(hidden, nc * 4)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         features = self.backbone(x)
         class_logits = self.class_head(features)
-        box = torch.sigmoid(self.box_head(features))
+        box = torch.sigmoid(self.box_head(features)).view(-1, class_logits.shape[-1], 4)
         return class_logits, box
 
 

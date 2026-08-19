@@ -67,6 +67,7 @@ class_id x_center y_center width height
 
 If `names` is omitted, Kestrel infers class names from the label files.
 If `imgsz` is omitted, Kestrel samples the dataset and picks a representative size.
+If an image contains multiple labeled boxes for the same class, Kestrel keeps only one annotation per class during preprocessing by selecting the largest box for that class.
 
 ## Training
 

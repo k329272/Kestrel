@@ -130,12 +130,21 @@ def _preprocess_split(image_paths, imgsz, adaptive_equalization=False, clahe_cli
         if not boxes:
             continue
 
-        cls_id, xc, yc, w, h = max(boxes, key=lambda b: b[3] * b[4])
+        # Keep at most one annotation per class by selecting the largest box for each class.
+        boxes_by_class = {}
+        for cls_id, xc, yc, w, h in boxes:
+            area = w * h
+            current = boxes_by_class.get(cls_id)
+            if current is None or area > current[-1]:
+                boxes_by_class[cls_id] = (xc, yc, w, h, area)
+
+        cls_ids = sorted(boxes_by_class.keys())
+        _, xc, yc, w, h, _ = max(boxes_by_class.values(), key=lambda b: b[-1])
         resized = cv2.resize(img, (target_width, target_height)).astype(np.float32) / 255.0
 
         images.append(resized)
         bbox_labels.append([xc, yc, w, h])
-        class_labels.append(cls_id)
+        class_labels.append(cls_ids)
 
     X = (
         np.expand_dims(np.array(images, dtype=np.float32), axis=-1)
@@ -143,7 +152,7 @@ def _preprocess_split(image_paths, imgsz, adaptive_equalization=False, clahe_cli
         else np.empty((0, target_height, target_width, 1), dtype=np.float32)
     )
     y_bbox = np.array(bbox_labels, dtype=np.float32) if bbox_labels else np.empty((0, 4), dtype=np.float32)
-    y_class = np.array(class_labels, dtype=np.int64) if class_labels else np.empty((0,), dtype=np.int64)
+    y_class = class_labels
     return X, y_bbox, y_class
 
 
@@ -199,7 +208,21 @@ def load_dataset(
         rng = np.random.default_rng(seed)
         idx = rng.permutation(n)
         val_idx, train_idx = idx[:n_val], idx[n_val:]
-        Xval, yb_val, yc_val = Xtr[val_idx], yb_tr[val_idx], yc_tr[val_idx]
-        Xtr, yb_tr, yc_tr = Xtr[train_idx], yb_tr[train_idx], yc_tr[train_idx]
+        yc_tr_list = list(yc_tr)
+        Xval, yb_val, yc_val = Xtr[val_idx], yb_tr[val_idx], [yc_tr_list[i] for i in val_idx]
+        Xtr, yb_tr, yc_tr = Xtr[train_idx], yb_tr[train_idx], [yc_tr_list[i] for i in train_idx]
+
+    nc = len(names) if names else 0
+
+    def _to_multihot(label_lists):
+        y = np.zeros((len(label_lists), nc), dtype=np.float32)
+        for row, cls_ids in enumerate(label_lists):
+            for cls_id in cls_ids:
+                if 0 <= int(cls_id) < nc:
+                    y[row, int(cls_id)] = 1.0
+        return y
+
+    yc_tr = _to_multihot(yc_tr)
+    yc_val = _to_multihot(yc_val)
 
     return Xtr, yb_tr, yc_tr, Xval, yb_val, yc_val, names, imgsz
