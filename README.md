@@ -84,13 +84,16 @@ Example:
 model.train(
     data="examples/data.yaml",
     epochs=25,
-    batch_size=32,
+    batch_size="auto",
     lr=1e-3,
     bbox_loss_weight=1.0,
     patience=5,
     save_best=True,
 )
 ```
+
+`batch_size="auto"` estimates a safe batch from the available system RAM and the
+current image size. You can still pass an explicit integer if you want to pin it.
 
 ## Prediction
 

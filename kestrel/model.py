@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,41 @@ from .nn import build_model
 from .results import Results
 
 DEFAULT_NAMES = {0: "Rock", 1: "Paper", 2: "Scissors"}
+
+
+def _available_ram_bytes() -> int | None:
+    """Best-effort cross-platform estimate of available system RAM."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = MEMORYSTATUSEX()
+            status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.ullAvailPhys)
+        except Exception:
+            return None
+        return None
+
+    if hasattr(os, "sysconf") and "SC_AVPHYS_PAGES" in os.sysconf_names and "SC_PAGE_SIZE" in os.sysconf_names:
+        try:
+            return int(os.sysconf("SC_AVPHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
+        except (OSError, ValueError, TypeError):
+            return None
+    return None
 
 
 def _normalize_names(names):
@@ -95,6 +131,24 @@ class Kestrel:
             "num_workers": num_workers,
             "persistent_workers": bool(num_workers),
         }
+
+    @staticmethod
+    def _auto_batch_size(Xtr, batch_size: int | str | None, device: torch.device) -> int:
+        if batch_size not in (None, "auto"):
+            return max(1, int(batch_size))
+        if len(Xtr) == 0:
+            return 1
+
+        sample_bytes = int(np.asarray(Xtr[0]).nbytes)
+        available = _available_ram_bytes()
+        if available is None:
+            return min(32, len(Xtr))
+
+        reserve = 512 * 1024 * 1024 if device.type == "cuda" else 256 * 1024 * 1024
+        usable = max(available - reserve, sample_bytes)
+        target = int(usable * (0.02 if device.type == "cuda" else 0.04))
+        estimated = max(1, target // max(1, sample_bytes))
+        return max(1, min(len(Xtr), estimated, 256))
 
     @staticmethod
     def _mean_loss(sum_value: float, count: int) -> float | None:
@@ -185,7 +239,7 @@ class Kestrel:
         self,
         data,
         epochs=20,
-        batch_size=32,
+        batch_size="auto",
         imgsz=None,
         val_split=0.2,
         lr=1e-3,
@@ -212,6 +266,8 @@ class Kestrel:
         ) = load_dataset(data, imgsz=imgsz, val_split=val_split)
 
         self._ensure_arch(detected_imgsz, names)
+
+        batch_size = self._auto_batch_size(Xtr, batch_size, self.device)
 
         Xtr_t = torch.from_numpy(Xtr).permute(0, 3, 1, 2).contiguous().float()
         yb_tr_t = torch.from_numpy(yb_tr).float()
