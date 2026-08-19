@@ -487,8 +487,7 @@ class Kestrel:
                 predict_bar.set_postfix(class_ids=",".join(map(str, class_ids.tolist())), conf=f"{float(confs.max()):.2f}")
         return out
 
-    @staticmethod
-    def _load_sources(source):
+    def _load_sources(self, source):
         sources = source if isinstance(source, (list, tuple)) else [source]
         images, originals = [], []
         for s in sources:
