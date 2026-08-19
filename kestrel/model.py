@@ -227,7 +227,7 @@ class Kestrel:
         )
 
     @staticmethod
-    def _class_specific_bbox_loss(bbox_pred, y_bbox, y_class, loss_fn):
+    def _class_specific_bbox_loss(bbox_pred, y_bbox, y_class, loss_fn, bbox_scale=None):
         """Compute bbox loss only for positive classes, sharing the same target box."""
         if bbox_pred.ndim != 3:
             raise ValueError(f"Expected bbox predictions with shape [B, nc, 4], got {tuple(bbox_pred.shape)}")
@@ -239,6 +239,9 @@ class Kestrel:
             return bbox_pred.sum() * 0.0
         pred = bbox_pred[mask]
         tgt = target[mask]
+        if bbox_scale is not None:
+            pred = pred * bbox_scale
+            tgt = tgt * bbox_scale
         return loss_fn(pred, tgt)
 
     # -------------------------------------------------------------- load/save
@@ -320,6 +323,10 @@ class Kestrel:
         )
 
         self._ensure_arch(detected_imgsz, names)
+        bbox_scale = torch.tensor(
+            [float(detected_imgsz[0]), float(detected_imgsz[1]), float(detected_imgsz[0]), float(detected_imgsz[1])],
+            device=self.device,
+        )
 
         batch_size = self._auto_batch_size(Xtr, batch_size, self.device)
 
@@ -365,7 +372,9 @@ class Kestrel:
                 with torch.autocast(device_type="cuda", enabled=use_amp):
                     class_logits, bbox_pred = self.model(xb)
                     class_loss = class_loss_fn(class_logits, y_class)
-                    bbox_loss = self._class_specific_bbox_loss(bbox_pred, y_bbox, y_class, bbox_loss_fn)
+                    bbox_loss = self._class_specific_bbox_loss(
+                        bbox_pred, y_bbox, y_class, bbox_loss_fn, bbox_scale=bbox_scale
+                    )
                     loss = class_loss + bbox_loss_weight * bbox_loss
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -440,9 +449,10 @@ class Kestrel:
     # ---------------------------------------------------------------------- val
     def val(self, data=None, batch_size=32):
         if data is not None:
+            imgsz = tuple(self.cfg.get("imgsz", (160, 120)))
             _, _, _, Xval, yb_val, yc_val, names, _ = load_dataset(
                 data,
-                imgsz=tuple(self.cfg.get("imgsz", (160, 120))),
+                imgsz=imgsz,
                 val_split=1.0,
                 adaptive_equalization=self.preprocess.get("adaptive_equalization", False),
                 clahe_clip_limit=self.preprocess.get("clahe_clip_limit", 2.0),
@@ -450,8 +460,11 @@ class Kestrel:
             )
             if names:
                 self.names = names
+            bbox_scale = torch.tensor([float(imgsz[0]), float(imgsz[1]), float(imgsz[0]), float(imgsz[1])], device=self.device)
         elif self._val_cache is not None:
             Xval, yb_val, yc_val = self._val_cache
+            imgsz = tuple(self.cfg.get("imgsz", (160, 120)))
+            bbox_scale = torch.tensor([float(imgsz[0]), float(imgsz[1]), float(imgsz[0]), float(imgsz[1])], device=self.device)
         else:
             raise ValueError("No validation data available. Call train() first or pass data=<yaml>.")
 
