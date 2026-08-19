@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -81,6 +82,79 @@ class Kestrel:
                 self.cfg["nc"] = len(self.names)
             self.model = build_model(self.cfg).to(self.device)
 
+    @staticmethod
+    def _resolve_loader_args(batch_size: int, pin_memory: bool | None, num_workers: int | None, device: torch.device):
+        if pin_memory is None:
+            pin_memory = device.type == "cuda"
+        if num_workers is None:
+            cpu_count = os.cpu_count() or 0
+            num_workers = min(4, cpu_count) if cpu_count > 1 else 0
+        return {
+            "batch_size": batch_size,
+            "pin_memory": pin_memory,
+            "num_workers": num_workers,
+        }
+
+    @staticmethod
+    def _mean_loss(sum_value: float, count: int) -> float | None:
+        return None if count <= 0 else sum_value / count
+
+    @staticmethod
+    def _metric_bundle(class_loss: float | None, bbox_loss: float | None, class_acc: float | None = None):
+        metrics: dict[str, Any] = {
+            "class_loss": class_loss,
+            "bbox_loss": bbox_loss,
+        }
+        if class_acc is not None:
+            metrics["class_accuracy"] = class_acc
+        total_loss = None
+        if class_loss is not None and bbox_loss is not None:
+            total_loss = class_loss + bbox_loss
+        metrics["total_loss"] = total_loss
+        return metrics
+
+    def _evaluate_tensors(self, Xval, yb_val, yc_val, batch_size: int = 32):
+        if len(Xval) == 0:
+            return self._metric_bundle(None, None, None)
+
+        Xval_t = torch.from_numpy(Xval).permute(0, 3, 1, 2).contiguous().float()
+        yb_val_t = torch.from_numpy(yb_val).float()
+        yc_val_t = torch.from_numpy(yc_val).long()
+        val_loader = DataLoader(
+            TensorDataset(Xval_t, yc_val_t, yb_val_t),
+            shuffle=False,
+            **self._resolve_loader_args(batch_size, pin_memory=None, num_workers=None, device=self.device),
+        )
+
+        self.model.eval()
+        class_loss_fn = nn.CrossEntropyLoss()
+        bbox_loss_fn = nn.SmoothL1Loss()
+        class_loss_sum = 0.0
+        bbox_loss_sum = 0.0
+        correct = 0
+        total = 0
+        use_amp = self.device.type == "cuda"
+        with torch.no_grad():
+            for xb, y_class, y_bbox in val_loader:
+                xb = xb.to(self.device, non_blocking=True)
+                y_class = y_class.to(self.device, non_blocking=True)
+                y_bbox = y_bbox.to(self.device, non_blocking=True)
+                with torch.autocast(device_type="cuda", enabled=use_amp):
+                    class_logits, bbox_pred = self.model(xb)
+                    class_loss = class_loss_fn(class_logits, y_class)
+                    bbox_loss = bbox_loss_fn(bbox_pred, y_bbox)
+                pred_labels = class_logits.argmax(dim=1)
+                batch = xb.size(0)
+                class_loss_sum += float(class_loss.item()) * batch
+                bbox_loss_sum += float(bbox_loss.item()) * batch
+                correct += int((pred_labels == y_class).sum().item())
+                total += batch
+
+        class_loss = self._mean_loss(class_loss_sum, total)
+        bbox_loss = self._mean_loss(bbox_loss_sum, total)
+        class_acc = None if total <= 0 else correct / total
+        return self._metric_bundle(class_loss, bbox_loss, class_acc)
+
     # -------------------------------------------------------------- load/save
     def _load(self, pt_path):
         if not os.path.exists(pt_path):
@@ -106,7 +180,25 @@ class Kestrel:
         return path
 
     # -------------------------------------------------------------------- train
-    def train(self, data, epochs=20, batch_size=32, imgsz=None, val_split=0.2, lr=1e-3, bbox_loss_weight=1.0):
+    def train(
+        self,
+        data,
+        epochs=20,
+        batch_size=32,
+        imgsz=None,
+        val_split=0.2,
+        lr=1e-3,
+        bbox_loss_weight=1.0,
+        patience=None,
+        min_delta=0.0,
+        scheduler_factor=0.5,
+        scheduler_patience=3,
+        num_workers=None,
+        pin_memory=None,
+        amp=None,
+        save_best=False,
+        best_path="kestrel_best.pt",
+    ):
         (
             Xtr,
             yb_tr,
@@ -125,16 +217,27 @@ class Kestrel:
         yc_tr_t = torch.from_numpy(yc_tr).long()
         train_loader = DataLoader(
             TensorDataset(Xtr_t, yc_tr_t, yb_tr_t),
-            batch_size=batch_size,
             shuffle=True,
+            **self._resolve_loader_args(batch_size, pin_memory=pin_memory, num_workers=num_workers, device=self.device),
         )
 
         self.model.train()
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=scheduler_factor,
+            patience=scheduler_patience,
+        )
         class_loss_fn = nn.CrossEntropyLoss()
         bbox_loss_fn = nn.SmoothL1Loss()
+        scaler = torch.amp.GradScaler("cuda", enabled=(self.device.type == "cuda" if amp is None else bool(amp) and self.device.type == "cuda"))
+        use_amp = self.device.type == "cuda" if amp is None else bool(amp) and self.device.type == "cuda"
 
         history = {"class_loss": [], "bbox_loss": [], "total_loss": []}
+        best_total = None
+        epochs_without_improve = 0
+        last_val_metrics = None
         epoch_bar = tqdm(range(epochs), desc="train", unit="epoch")
         for _epoch in epoch_bar:
             class_loss_sum = 0.0
@@ -143,17 +246,19 @@ class Kestrel:
             count = 0
             batch_bar = tqdm(train_loader, desc="batch", unit="batch", leave=False)
             for xb, y_class, y_bbox in batch_bar:
-                xb = xb.to(self.device)
-                y_class = y_class.to(self.device)
-                y_bbox = y_bbox.to(self.device)
+                xb = xb.to(self.device, non_blocking=True)
+                y_class = y_class.to(self.device, non_blocking=True)
+                y_bbox = y_bbox.to(self.device, non_blocking=True)
 
                 optimizer.zero_grad(set_to_none=True)
-                class_logits, bbox_pred = self.model(xb)
-                class_loss = class_loss_fn(class_logits, y_class)
-                bbox_loss = bbox_loss_fn(bbox_pred, y_bbox)
-                loss = class_loss + bbox_loss_weight * bbox_loss
-                loss.backward()
-                optimizer.step()
+                with torch.autocast(device_type="cuda", enabled=use_amp):
+                    class_logits, bbox_pred = self.model(xb)
+                    class_loss = class_loss_fn(class_logits, y_class)
+                    bbox_loss = bbox_loss_fn(bbox_pred, y_bbox)
+                    loss = class_loss + bbox_loss_weight * bbox_loss
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
                 batch = xb.size(0)
                 class_loss_sum += float(class_loss.item()) * batch
@@ -170,17 +275,34 @@ class Kestrel:
             history["class_loss"].append(class_loss_sum / max(1, count))
             history["bbox_loss"].append(bbox_loss_sum / max(1, count))
             history["total_loss"].append(total_sum / max(1, count))
+            scheduler.step(history["total_loss"][-1])
             epoch_bar.set_postfix(
                 class_loss=history["class_loss"][-1],
                 bbox_loss=history["bbox_loss"][-1],
                 total_loss=history["total_loss"][-1],
             )
 
-        self.metrics = {
-            "class_loss": history["class_loss"][-1] if history["class_loss"] else None,
-            "bbox_loss": history["bbox_loss"][-1] if history["bbox_loss"] else None,
-            "total_loss": history["total_loss"][-1] if history["total_loss"] else None,
+            val_metrics = self._evaluate_tensors(Xval, yb_val, yc_val, batch_size=batch_size)
+            last_val_metrics = val_metrics
+            current_total = val_metrics.get("total_loss")
+            if current_total is not None:
+                improved = best_total is None or current_total < (best_total - min_delta)
+                if improved:
+                    best_total = current_total
+                    epochs_without_improve = 0
+                    if save_best:
+                        self.save(best_path)
+                else:
+                    epochs_without_improve += 1
+                    if patience is not None and epochs_without_improve >= patience:
+                        break
+
+        train_metrics = {
+            "class_loss": self._mean_loss(sum(history["class_loss"]), len(history["class_loss"])) if history["class_loss"] else None,
+            "bbox_loss": self._mean_loss(sum(history["bbox_loss"]), len(history["bbox_loss"])) if history["bbox_loss"] else None,
+            "total_loss": self._mean_loss(sum(history["total_loss"]), len(history["total_loss"])) if history["total_loss"] else None,
         }
+        self.metrics = last_val_metrics or train_metrics
         self.train_args = {
             "data": data,
             "epochs": epochs,
@@ -188,6 +310,15 @@ class Kestrel:
             "imgsz": list(detected_imgsz),
             "lr": lr,
             "bbox_loss_weight": bbox_loss_weight,
+            "patience": patience,
+            "min_delta": min_delta,
+            "scheduler_factor": scheduler_factor,
+            "scheduler_patience": scheduler_patience,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+            "amp": amp,
+            "save_best": save_best,
+            "best_path": best_path,
         }
         self._val_cache = (Xval, yb_val, yc_val)
         return self.metrics
@@ -205,54 +336,7 @@ class Kestrel:
         else:
             raise ValueError("No validation data available. Call train() first or pass data=<yaml>.")
 
-        if len(Xval) == 0:
-            self.metrics = {"class_loss": None, "class_accuracy": None, "bbox_loss": None}
-            return self.metrics
-
-        Xval_t = torch.from_numpy(Xval).permute(0, 3, 1, 2).contiguous().float().to(self.device)
-        yb_val_t = torch.from_numpy(yb_val).float().to(self.device)
-        yc_val_t = torch.from_numpy(yc_val).long().to(self.device)
-
-        self.model.eval()
-        class_loss_fn = nn.CrossEntropyLoss()
-        bbox_loss_fn = nn.SmoothL1Loss()
-        with torch.no_grad():
-            val_loader = DataLoader(
-                TensorDataset(Xval_t, yc_val_t, yb_val_t),
-                batch_size=batch_size,
-                shuffle=False,
-            )
-            class_loss_sum = 0.0
-            bbox_loss_sum = 0.0
-            correct = 0
-            total = 0
-            val_bar = tqdm(val_loader, desc="val", unit="batch")
-            for xb, y_class, y_bbox in val_bar:
-                class_logits, bbox_pred = self.model(xb)
-                class_loss = class_loss_fn(class_logits, y_class)
-                bbox_loss = bbox_loss_fn(bbox_pred, y_bbox)
-                pred_labels = class_logits.argmax(dim=1)
-
-                batch = xb.size(0)
-                class_loss_sum += float(class_loss.item()) * batch
-                bbox_loss_sum += float(bbox_loss.item()) * batch
-                correct += int((pred_labels == y_class).sum().item())
-                total += batch
-
-                val_bar.set_postfix(
-                    class_loss=float(class_loss.item()),
-                    bbox_loss=float(bbox_loss.item()),
-                )
-
-            class_loss = class_loss_sum / max(1, total)
-            bbox_loss = bbox_loss_sum / max(1, total)
-            class_acc = correct / max(1, total)
-
-        self.metrics = {
-            "class_loss": class_loss,
-            "class_accuracy": class_acc,
-            "bbox_loss": bbox_loss,
-        }
+        self.metrics = self._evaluate_tensors(Xval, yb_val, yc_val, batch_size=batch_size)
         return self.metrics
 
     # ----------------------------------------------------------------- predict
